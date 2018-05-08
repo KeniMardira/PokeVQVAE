@@ -29,13 +29,14 @@ class Net(nn.Module):
         self.conv_e4 = nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1)
         self.bn_e4 = nn.BatchNorm2d(256)
         
-        self.fc_mean = nn.Linear(256*RESIZE//16*RESIZE//16, latent_dim)
-        self.fc_logvar = nn.Linear(256*RESIZE//16*RESIZE//16, latent_dim)
+        self.conv_e5 = nn.Conv2d(256, 64, kernel_size = 1, stride = 1)
+        self.bn_e5 = nn.BatchNorm2d(64)
         
         #decoder
-        self.fc_d = nn.Linear(latent_dim, 256*RESIZE//16*RESIZE//16)
-        
         self.up = nn.Upsample(scale_factor=2)
+        
+        self.conv_d0 = nn.Conv2d(64, 256, kernel_size = 1, stride = 1)
+        self.bn_d0 = nn.BatchNorm2d(256)
         
         self.conv_d1 = nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1)
         self.bn_d1 = nn.BatchNorm2d(128)
@@ -45,6 +46,16 @@ class Net(nn.Module):
         self.bn_d3 = nn.BatchNorm2d(32)
         self.conv_d4 = nn.Conv2d(32, 3, kernel_size=3, stride=1, padding=1)
         
+        self.K = LATENT_DIM
+        self.D = 64*RESIZE//16*RESIZE//16
+        self.dict = nn.Embedding(self.K, self.D) # K = LATENT_DIM, D = 4096
+        
+        self.init_weights()        
+        
+    def init_weights(self):
+        initrange = 1.0 / self.K
+        self.dict.weight.data.uniform_(-initrange, initrange) 
+        
     def encoder(self, x):
         ''' encoder: q(z|x)
             input: x, output: mean, logvar
@@ -53,28 +64,21 @@ class Net(nn.Module):
         x = F.leaky_relu(self.bn_e2(self.conv_e2(x)))
         x = F.leaky_relu(self.bn_e3(self.conv_e3(x)))
         x = F.leaky_relu(self.bn_e4(self.conv_e4(x)))
-        x = x.view(-1, x.shape[1] * x.shape[2] * x.shape[3])
-        z_mean = self.fc_mean(x)
-        z_logvar = self.fc_logvar(x)
-        return z_mean, z_logvar
-    
-    def latent(self, z_mu, z_logvar):
-        ''' 
-            encoder: z = mu + sd * e
-            input: mean, logvar. output: z
-        '''
-        sd = torch.exp(z_logvar * 0.5)
-        e = Variable(torch.randn(sd.size())).cuda()
-        z = e.mul(sd).add_(z_mu)
-        return z 
+        x = F.leaky_relu(self.bn_e5(self.conv_e5(x)))
+        
+        # output b x 64 x 8 x 8
+        # x = x.view(-1, x.shape[1] * x.shape[2] * x.shape[3])
+        # z_mean = self.fc_mean(x)
+        # z_logvar = self.fc_logvar(x)
+        return x
     
     def decoder(self, z):
         '''
             decoder: p(x|z)
             input: z. output: x
         '''
-        x = self.fc_d(z)
-        x = x.view(-1, 256, RESIZE//16, RESIZE//16)
+        x = z.view(-1, 64, RESIZE//16, RESIZE//16)
+        x = F.leaky_relu(self.bn_d0(self.conv_d0(x)))
         x = F.leaky_relu(self.bn_d1(self.conv_d1(self.up(x))))
         x = F.leaky_relu(self.bn_d2(self.conv_d2(self.up(x))))
         x = F.leaky_relu(self.bn_d3(self.conv_d3(self.up(x))))
@@ -82,7 +86,40 @@ class Net(nn.Module):
         return x.view(-1,3,RESIZE,RESIZE)
 
     def forward(self, x):
-        z_mean, z_logvar = self.encoder(x)
-        z = self.latent(z_mean, z_logvar)
-        x_out = self.decoder(z)
-        return x_out, z_mean, z_logvar
+        Z_e = self.encoder(x)
+        
+        org_Z_e = Z_e
+        
+        sz = Z_e.size()
+        Z_e = Z_e.permute(0,2,3,1)
+        Z_e = Z_e.contiguous()
+        Z = Z_e.view(-1, self.D) # b x D
+        W = self.dict.weight
+        
+        def L2(a,b):
+            return ((a-b)**2)
+        
+        # sample nearest embedding
+        j = L2(Z[:,None], W[None,:]).sum(2).min(1)[1]
+        W_j = W[j] # b x D
+        
+        Z_sg = Z.detach()
+        W_j_sg = W_j.detach()
+        
+        Z_e = W_j.view(sz[0], sz[2], sz[3], sz[1])
+        Z_e = Z_e.permute(0,3,1,2)
+        
+        def hook(grad):
+            nonlocal org_Z_e
+            self.saved_grad = grad
+            self.saved_Z_e = org_Z_e
+            return grad
+        
+        Z_e.register_hook(hook)
+        
+        return self.decoder(Z_e), L2(Z,W_j_sg).sum(1).mean(), L2(Z_sg,W_j).sum(1).mean()
+    
+    def bwd(self):
+        self.saved_Z_e.backward(self.saved_grad)
+        
+    
